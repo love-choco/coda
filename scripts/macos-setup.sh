@@ -60,9 +60,9 @@ if [[ $COMPILE_THINGS == "YES" ]]; then
 
   opam update
   # This is dirty, keep the OCaml project version up to date!
-  opam switch create 4.07.1+statistical-memprof || true
-  opam switch 4.07.1+statistical-memprof
-
+  opam switch create 4.08.1 || true 
+  opam switch 4.08.1
+  
   # All our ocaml packages
   opam switch -y import src/opam.export
   eval $(opam config env)
