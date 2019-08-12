@@ -135,9 +135,12 @@ let run_test () : unit Deferred.t =
               ; addrs_and_ports=
                   { external_ip= Unix.Inet_addr.localhost
                   ; bind_ip= Unix.Inet_addr.localhost
+                  ; communication_port= 8000
                   ; discovery_port= 8001
-                  ; communication_port= 8000 }
+                  ; libp2p_port= 8002 }
               ; trust_system
+              ; enable_libp2p= false
+              ; disable_haskell= false
               ; max_concurrent_connections= Some 10 } }
       in
       Core.Backtrace.elide := false ;

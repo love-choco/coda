@@ -561,6 +561,8 @@ struct
           ; conf_dir: string
           ; logger: Logger.t
           ; trust_system: Trust_system.t
+          ; enable_libp2p: bool
+          ; disable_haskell: bool
           ; max_concurrent_connections: int option }
         [@@deriving make]
       end
