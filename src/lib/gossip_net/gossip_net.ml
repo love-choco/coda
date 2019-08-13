@@ -47,30 +47,25 @@ module type S = sig
     type t = Banned | Allowed of Rpc.Connection.t Ivar.t
   end
 
+  module Config : Config_intf
+
   type t =
-    { timeout: Time.Span.t
-    ; logger: Logger.t
-    ; trust_system: Trust_system.t
-    ; conf_dir: string
-    ; target_peer_count: int
+    {
+      config: Config.t
     ; broadcast_writer: msg Linear_pipe.Writer.t
     ; received_reader: msg Envelope.Incoming.t Strict_pipe.Reader.t
-    ; addrs_and_ports: Kademlia.Node_addrs_and_ports.t
-    ; initial_peers: Host_and_port.t list
     ; peers: Peer.Hash_set.t
     ; peers_by_ip: (Unix.Inet_addr.t, Peer.t list) Hashtbl.t
     ; disconnected_peers: Peer.Hash_set.t
     ; ban_notification_reader: ban_notification Linear_pipe.Reader.t
     ; ban_notification_writer: ban_notification Linear_pipe.Writer.t
-    ; mutable membership: Membership.t
+    ; mutable haskell_membership: Membership.t option
     ; connections:
         ( Unix.Inet_addr.t
         , (Uuid.t, Connection_with_state.t) Hashtbl.t )
         Hashtbl.t
-    ; first_connect: unit Ivar.t
-    ; max_concurrent_connections: int option }
+    ; first_connect: unit Ivar.t }
 
-  module Config : Config_intf
 
   val create :
     Config.t -> Host_and_port.t Rpc.Implementation.t list -> t Deferred.t
@@ -109,33 +104,6 @@ module Make (Message : Message_intf) : S with type msg := Message.msg = struct
       match t with Allowed c -> when_allowed c | _ -> when_banned
   end
 
-  type t =
-    { timeout: Time.Span.t
-    ; logger: Logger.t
-    ; trust_system: Trust_system.t
-    ; conf_dir: string
-    ; target_peer_count: int
-    ; broadcast_writer: Message.msg Linear_pipe.Writer.t
-    ; received_reader: Message.msg Envelope.Incoming.t Strict_pipe.Reader.t
-    ; addrs_and_ports: Kademlia.Node_addrs_and_ports.t
-    ; initial_peers: Host_and_port.t list
-    ; peers: Peer.Hash_set.t
-    ; peers_by_ip: (Unix.Inet_addr.t, Peer.t list) Hashtbl.t
-    ; disconnected_peers: Peer.Hash_set.t
-    ; ban_notification_reader: ban_notification Linear_pipe.Reader.t
-    ; ban_notification_writer: ban_notification Linear_pipe.Writer.t
-    ; mutable membership: Membership.t
-    ; connections:
-        ( Unix.Inet_addr.t
-        , (Uuid.t, Connection_with_state.t) Hashtbl.t )
-        Hashtbl.t
-          (**mapping a Uuid to a connection to be able to remove it from the hash
-         *table since Rpc.Connection.t doesn't have the socket information*)
-    ; first_connect: unit Ivar.t
-    ; max_concurrent_connections: int option
-          (* maximum number of concurrent connections from an ip (infinite if None)*)
-    }
-
   module Config = struct
     type t =
       { timeout: Time.Span.t
@@ -151,6 +119,23 @@ module Make (Message : Message_intf) : S with type msg := Message.msg = struct
     [@@deriving make]
   end
 
+  type t =
+    {
+      config: Config.t
+    ; broadcast_writer: Message.msg Linear_pipe.Writer.t
+    ; received_reader: Message.msg Envelope.Incoming.t Strict_pipe.Reader.t
+    ; peers: Peer.Hash_set.t
+    ; peers_by_ip: (Unix.Inet_addr.t, Peer.t list) Hashtbl.t
+    ; disconnected_peers: Peer.Hash_set.t
+    ; ban_notification_reader: ban_notification Linear_pipe.Reader.t
+    ; ban_notification_writer: ban_notification Linear_pipe.Writer.t
+    ; mutable haskell_membership: Membership.t option
+    ; connections:
+        ( Unix.Inet_addr.t
+        , (Uuid.t, Connection_with_state.t) Hashtbl.t )
+        Hashtbl.t
+    ; first_connect: unit Ivar.t }
+
   (* OPTIMIZATION: use fast n choose k implementation - see python or old flow code *)
   let random_sublist xs n = List.take (List.permute xs) n
 
@@ -159,7 +144,7 @@ module Make (Message : Message_intf) : S with type msg := Message.msg = struct
 
   let to_where_to_connect (t : t) (peer : Peer.t) =
     Tcp.Where_to_connect.of_host_and_port
-      ~bind_to_address:t.addrs_and_ports.bind_ip
+      ~bind_to_address:t.config.addrs_and_ports.bind_ip
     @@ { Host_and_port.host= Unix.Inet_addr.to_string peer.host
        ; port= peer.communication_port }
 
@@ -174,7 +159,7 @@ module Make (Message : Message_intf) : S with type msg := Message.msg = struct
         other nodes
   *)
   let remove_peer t peer =
-    Logger.info t.logger ~module_:__MODULE__ ~location:__LOC__
+    Logger.info t.config.logger ~module_:__MODULE__ ~location:__LOC__
       !"Removing peer from peer set: %s"
       (Peer.to_string peer)
       ~metadata:[("peer", Peer.to_yojson peer)] ;
@@ -188,59 +173,68 @@ module Make (Message : Message_intf) : S with type msg := Message.msg = struct
 
   let mark_peer_disconnected t peer =
     remove_peer t peer ;
-    Logger.info t.logger ~module_:__MODULE__ ~location:__LOC__
+    Logger.info t.config.logger ~module_:__MODULE__ ~location:__LOC__
       !"Moving peer to disconnected peer set : %{sexp: Peer.t}"
       peer ;
     Hash_set.add t.disconnected_peers peer
 
+  let add_peer t peer =
+    Coda_metrics.(Gauge.inc_one Network.peers) ;
+    Hash_set.add t.peers peer ;
+    Hashtbl.add_multi t.peers_by_ip ~key:peer.host ~data:peer ;
+    if
+      Int.equal (Hash_set.length t.peers)
+        disconnect_clear_threshold
+    then Hash_set.clear t.disconnected_peers
+    else Hash_set.remove t.disconnected_peers peer
+
+  let haskell_missing = "old membership is enabled but the t.haskell_membership is None"
+
   let record_peer_events t =
     let open Peer.Event in
     trace_task "peer events" (fun () ->
+      match t.config.disable_haskell with
+      | false ->
         Linear_pipe.iter_unordered ~max_concurrency:64
-          (Membership.changes t.membership) ~f:(function
+          (Membership.changes (Option.value_exn ~message:haskell_missing t.haskell_membership)) ~f:(function
           | Connect peers ->
               Ivar.fill_if_empty t.first_connect () ;
-              Logger.info t.logger ~module_:__MODULE__ ~location:__LOC__
+              Logger.info t.config.logger ~module_:__MODULE__ ~location:__LOC__
                 !"Connected to some peers [%s]"
                 (Peer.pretty_list peers) ;
-              List.iter peers ~f:(fun peer ->
-                  Coda_metrics.(Gauge.inc_one Network.peers) ;
-                  Hash_set.add t.peers peer ;
-                  Hashtbl.add_multi t.peers_by_ip ~key:peer.host ~data:peer ;
-                  if
-                    Int.equal (Hash_set.length t.peers)
-                      disconnect_clear_threshold
-                  then Hash_set.clear t.disconnected_peers
-                  else Hash_set.remove t.disconnected_peers peer ) ;
+              List.iter peers ~f:(add_peer t);
               Deferred.unit
           | Disconnect peers ->
-              Logger.info t.logger ~module_:__MODULE__ ~location:__LOC__
+              Logger.info t.config.logger ~module_:__MODULE__ ~location:__LOC__
                 "Some peers disconnected: %s" (Peer.pretty_list peers) ;
               List.iter peers ~f:(mark_peer_disconnected t) ;
               Deferred.unit )
-        |> ignore )
+        |> ignore
+       | true -> () )
 
   let restart_kademlia t addl_peers =
-    Logger.info t.logger ~module_:__MODULE__ ~location:__LOC__
+    Logger.info t.config.logger ~module_:__MODULE__ ~location:__LOC__
       "Restarting Kademlia" ;
-    let%bind () = Membership.stop t.membership in
+    match t.config.disable_haskell with
+    | false -> (let%bind () = Membership.stop (Option.value_exn ~message:haskell_missing t.haskell_membership) in
     let%map new_membership =
       let initial_peers =
         List.dedup_and_sort ~compare:Host_and_port.compare
-        @@ t.initial_peers @ addl_peers
+        @@ t.config.initial_peers @ addl_peers
       in
-      Membership.connect ~node_addrs_and_ports:t.addrs_and_ports ~initial_peers
-        ~conf_dir:t.conf_dir ~logger:t.logger ~trust_system:t.trust_system
+      Membership.connect ~node_addrs_and_ports:t.config.addrs_and_ports ~initial_peers
+        ~conf_dir:t.config.conf_dir ~logger:t.config.logger ~trust_system:t.config.trust_system
     in
     match new_membership with
     | Ok membership ->
-        t.membership <- membership ;
+        t.haskell_membership <- Some membership ;
         record_peer_events t
     | Error _ ->
-        failwith "Could not restart Kademlia"
+        failwith "Could not restart Kademlia")
+    | true -> Deferred.unit
 
   let unmark_all_disconnected_peers t =
-    Logger.info t.logger ~module_:__MODULE__ ~location:__LOC__
+    Logger.info t.config.logger ~module_:__MODULE__ ~location:__LOC__
       !"Clearing disconnected peer set : %{sexp: Peer.t list}"
       (Hash_set.to_list t.disconnected_peers) ;
     let disconnected_peers =
@@ -271,7 +265,7 @@ module Make (Message : Message_intf) : S with type msg := Message.msg = struct
                (fun conn ->
                  match%bind Versioned_rpc.Connection_with_menu.create conn with
                  | Ok _conn' ->
-                     Logger.info t.logger ~module_:__MODULE__ ~location:__LOC__
+                     Logger.info t.config.logger ~module_:__MODULE__ ~location:__LOC__
                        !"Reconnected to a random disconnected peer: %{sexp: \
                          Peer.t}"
                        peer ;
@@ -295,7 +289,7 @@ module Make (Message : Message_intf) : S with type msg := Message.msg = struct
           let%map () =
             if Hash_set.mem t.disconnected_peers peer then (
               (* optimistically, mark all disconnected peers as peers *)
-              Logger.info t.logger ~module_:__MODULE__ ~location:__LOC__
+              Logger.info t.config.logger ~module_:__MODULE__ ~location:__LOC__
                 !"On RPC call, reconnected to a disconnected peer: %{sexp: \
                   Peer.t}"
                 peer ;
@@ -305,7 +299,7 @@ module Make (Message : Message_intf) : S with type msg := Message.msg = struct
           Ok result
       | Ok (Error err) -> (
           (* call succeeded, result is an error *)
-          Logger.error t.logger ~module_:__MODULE__ ~location:__LOC__
+          Logger.error t.config.logger ~module_:__MODULE__ ~location:__LOC__
             "RPC call error: $error, same error in machine format: \
              $machine_error"
             ~metadata:
@@ -318,7 +312,7 @@ module Make (Message : Message_intf) : S with type msg := Message.msg = struct
                 ; _ ] ) ->
               let%map () =
                 Trust_system.(
-                  record t.trust_system t.logger peer.host
+                  record t.config.trust_system t.config.logger peer.host
                     Actions.
                       (Outgoing_connection_error, Some ("handshake error", [])))
               in
@@ -333,7 +327,7 @@ module Make (Message : Message_intf) : S with type msg := Message.msg = struct
                 ; _rpc_version ] ) ->
               let%map () =
                 Trust_system.(
-                  record t.trust_system t.logger peer.host
+                  record t.config.trust_system t.config.logger peer.host
                     Actions.
                       ( Outgoing_connection_error
                       , Some ("Closed connection", []) ))
@@ -342,7 +336,7 @@ module Make (Message : Message_intf) : S with type msg := Message.msg = struct
           | _ ->
               let%map () =
                 Trust_system.(
-                  record t.trust_system t.logger peer.host
+                  record t.config.trust_system t.config.logger peer.host
                     Actions.
                       ( Violated_protocol
                       , Some
@@ -359,7 +353,7 @@ module Make (Message : Message_intf) : S with type msg := Message.msg = struct
             when is_unix_errno errno Unix.ECONNREFUSED ->
               let%map () =
                 Trust_system.(
-                  record t.trust_system t.logger peer.host
+                  record t.config.trust_system t.config.logger peer.host
                     Actions.
                       ( Outgoing_connection_error
                       , Some ("Connection refused", []) ))
@@ -367,7 +361,7 @@ module Make (Message : Message_intf) : S with type msg := Message.msg = struct
               mark_peer_disconnected t peer ;
               Or_error.of_exn exn
           | _ ->
-              Logger.error t.logger ~module_:__MODULE__ ~location:__LOC__
+              Logger.error t.config.logger ~module_:__MODULE__ ~location:__LOC__
                 "RPC call raised an exception: $exn"
                 ~metadata:[("exn", `String (Exn.to_string exn))] ;
               return (Or_error.of_exn exn) )
@@ -377,16 +371,16 @@ module Make (Message : Message_intf) : S with type msg := Message.msg = struct
         call ()
     | Some conn_map ->
         if
-          Option.is_some t.max_concurrent_connections
+          Option.is_some t.config.max_concurrent_connections
           && Hashtbl.length conn_map
-             >= Option.value_exn t.max_concurrent_connections
+             >= Option.value_exn t.config.max_concurrent_connections
         then
           Deferred.return
             (Or_error.errorf
                !"Not connecting to peer %s. Number of open connections to the \
                  peer equals the limit %d.\n"
                (Peer.to_string peer)
-               (Option.value_exn t.max_concurrent_connections))
+               (Option.value_exn t.config.max_concurrent_connections))
         else call ()
 
   let broadcast_selected t peers msg =
@@ -401,7 +395,7 @@ module Make (Message : Message_intf) : S with type msg := Message.msg = struct
         | Ok () ->
             ()
         | Error e ->
-            Logger.error t.logger ~module_:__MODULE__ ~location:__LOC__
+            Logger.error t.config.logger ~module_:__MODULE__ ~location:__LOC__
               "Broadcasting message $message_summary to $peer failed: $error"
               ~metadata:
                 [ ("error", `String (Error.to_string_hum e))
@@ -464,7 +458,8 @@ module Make (Message : Message_intf) : S with type msg := Message.msg = struct
                 (Exn.to_string e) ()
         in
         let%bind membership =
-          match%map
+          if not config.disable_haskell then
+          (match%map
             Monitor.try_with
               (fun () ->
                 trace_task "membership" (fun () ->
@@ -475,11 +470,11 @@ module Make (Message : Message_intf) : S with type msg := Message.msg = struct
               ~rest:(`Call handle_exn)
           with
           | Ok (Ok membership) ->
-              membership
+              Some membership
           | Ok (Error e) ->
               fail (Error.to_string_hum e)
           | Error e ->
-              fail (Exn.to_string e)
+              fail (Exn.to_string e)) else Deferred.return None
         in
         let first_connect = Ivar.create () in
         let broadcast_reader, broadcast_writer = Linear_pipe.create () in
@@ -491,23 +486,16 @@ module Make (Message : Message_intf) : S with type msg := Message.msg = struct
           Linear_pipe.create ()
         in
         let t =
-          { timeout= config.timeout
-          ; logger= config.logger
-          ; trust_system= config.trust_system
-          ; conf_dir= config.conf_dir
-          ; target_peer_count= config.target_peer_count
+          { config
           ; broadcast_writer
           ; received_reader
-          ; addrs_and_ports= config.addrs_and_ports
           ; peers= Peer.Hash_set.create ()
-          ; initial_peers= config.initial_peers
           ; peers_by_ip= Hashtbl.create (module Unix.Inet_addr)
           ; disconnected_peers= Peer.Hash_set.create ()
           ; ban_notification_reader
           ; ban_notification_writer
-          ; membership
+          ; haskell_membership= membership
           ; connections= Hashtbl.create (module Unix.Inet_addr)
-          ; max_concurrent_connections= config.max_concurrent_connections
           ; first_connect }
         in
         t_for_restarting := Some t ;
@@ -526,7 +514,7 @@ module Make (Message : Message_intf) : S with type msg := Message.msg = struct
                | None ->
                    Deferred.unit
                | Some conn_tbl ->
-                   Logger.debug t.logger ~module_:__MODULE__ ~location:__LOC__
+                   Logger.debug t.config.logger ~module_:__MODULE__ ~location:__LOC__
                      !"Peer %s banned, disconnecting."
                      (Unix.Inet_addr.to_string addr) ;
                    let%map () =
@@ -547,9 +535,9 @@ module Make (Message : Message_intf) : S with type msg := Message.msg = struct
             don't_wait_for
               (Linear_pipe.iter_unordered ~max_concurrency:64 broadcast_reader
                  ~f:(fun m ->
-                   Logger.trace t.logger ~module_:__MODULE__ ~location:__LOC__
+                   Logger.trace t.config.logger ~module_:__MODULE__ ~location:__LOC__
                      "broadcasting message" ;
-                   broadcast_random t t.target_peer_count m )) ) ;
+                   broadcast_random t t.config.target_peer_count m )) ) ;
         let implementations =
           let implementations =
             Versioned_rpc.Menu.add
@@ -571,7 +559,7 @@ module Make (Message : Message_intf) : S with type msg := Message.msg = struct
             let inet_addr = Unix.Inet_addr.of_string conn.Host_and_port.host in
             Deferred.don't_wait_for
               Trust_system.(
-                record t.trust_system t.logger inet_addr
+                record t.config.trust_system t.config.logger inet_addr
                   Actions.
                     ( Violated_protocol
                     , Some
@@ -590,7 +578,7 @@ module Make (Message : Message_intf) : S with type msg := Message.msg = struct
             ~on_handler_error:
               (`Call
                 (fun addr exn ->
-                  Logger.error t.logger ~module_:__MODULE__ ~location:__LOC__
+                  Logger.error t.config.logger ~module_:__MODULE__ ~location:__LOC__
                     "Exception raised in gossip net TCP server handler when \
                      connected to address $address: $exn"
                     ~metadata:
@@ -599,13 +587,13 @@ module Make (Message : Message_intf) : S with type msg := Message.msg = struct
                   raise exn ))
             Tcp.(
               Where_to_listen.bind_to
-                (Bind_to_address.Address t.addrs_and_ports.bind_ip)
-                (Bind_to_port.On_port t.addrs_and_ports.communication_port))
+                (Bind_to_address.Address t.config.addrs_and_ports.bind_ip)
+                (Bind_to_port.On_port t.config.addrs_and_ports.communication_port))
             (fun client reader writer ->
               let client_inet_addr = Socket.Address.Inet.addr client in
               let%bind () =
                 Trust_system.(
-                  record t.trust_system t.logger client_inet_addr
+                  record t.config.trust_system t.config.logger client_inet_addr
                     Actions.(Connected, None))
               in
               let conn_map =
@@ -616,7 +604,7 @@ module Make (Message : Message_intf) : S with type msg := Message.msg = struct
               in
               let is_client_banned =
                 let peer_status =
-                  Trust_system.Peer_trust.lookup t.trust_system
+                  Trust_system.Peer_trust.lookup t.config.trust_system
                     client_inet_addr
                 in
                 match peer_status.banned with
@@ -626,23 +614,23 @@ module Make (Message : Message_intf) : S with type msg := Message.msg = struct
                     false
               in
               if is_client_banned then (
-                Logger.info t.logger ~module_:__MODULE__ ~location:__LOC__
+                Logger.info t.config.logger ~module_:__MODULE__ ~location:__LOC__
                   "Rejecting connection from banned peer %s"
                   (Socket.Address.Inet.to_string client) ;
                 Deferred.unit )
               else if
-                Option.is_some t.max_concurrent_connections
+                Option.is_some t.config.max_concurrent_connections
                 && Hashtbl.length conn_map
-                   >= Option.value_exn t.max_concurrent_connections
+                   >= Option.value_exn t.config.max_concurrent_connections
               then (
-                Logger.error t.logger ~module_:__MODULE__ ~location:__LOC__
+                Logger.error t.config.logger ~module_:__MODULE__ ~location:__LOC__
                   "Gossip net TCP server cannot open another connection. \
                    Number of open connections from client $client equals the \
                    limit $max_connections"
                   ~metadata:
                     [ ("client", `String (Socket.Address.Inet.to_string client))
                     ; ( "max_connections"
-                      , `Int (Option.value_exn t.max_concurrent_connections) )
+                      , `Int (Option.value_exn t.config.max_concurrent_connections) )
                     ] ;
                 Deferred.unit )
               else
@@ -670,7 +658,7 @@ module Make (Message : Message_intf) : S with type msg := Message.msg = struct
                       (`Call
                         (fun exn ->
                           Trust_system.(
-                            record t.trust_system t.logger client_inet_addr
+                            record t.config.trust_system t.config.logger client_inet_addr
                               Actions.
                                 ( Incoming_connection_error
                                 , Some
@@ -696,15 +684,15 @@ module Make (Message : Message_intf) : S with type msg := Message.msg = struct
 
   let peers t = Hash_set.to_list t.peers
 
-  let initial_peers t = t.initial_peers
+  let initial_peers t = t.config.initial_peers
 
   let ban_notification_reader t = t.ban_notification_reader
 
   let broadcast_all t msg =
     let to_broadcast = ref (List.permute (Hash_set.to_list t.peers)) in
     stage (fun () ->
-        let selected = List.take !to_broadcast t.target_peer_count in
-        to_broadcast := List.drop !to_broadcast t.target_peer_count ;
+        let selected = List.take !to_broadcast t.config.target_peer_count in
+        to_broadcast := List.drop !to_broadcast t.config.target_peer_count ;
         let%map () = broadcast_selected t selected msg in
         if List.length !to_broadcast = 0 then `Done else `Continue )
 
@@ -726,13 +714,13 @@ module Make (Message : Message_intf) : S with type msg := Message.msg = struct
     random_sublist (Hash_set.to_list new_peers) n
 
   let query_peer t (peer : Peer.t) rpc query =
-    Logger.trace t.logger ~module_:__MODULE__ ~location:__LOC__
+    Logger.trace t.config.logger ~module_:__MODULE__ ~location:__LOC__
       !"Querying peer %s" (Peer.to_string peer) ;
     try_call_rpc t peer rpc query
 
   let query_random_peers t n rpc query =
     let peers = random_peers t n in
-    Logger.trace t.logger ~module_:__MODULE__ ~location:__LOC__
+    Logger.trace t.config.logger ~module_:__MODULE__ ~location:__LOC__
       !"Querying random peers: %s"
       (Peer.pretty_list peers) ;
     List.map peers ~f:(fun peer -> query_peer t peer rpc query)
