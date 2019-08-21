@@ -64,6 +64,7 @@ module Helper = struct
     ; subscriptions: (int, subscription) Hashtbl.t
     ; streams: (int, stream) Hashtbl.t
     ; protocol_handlers: (string, protocol_handler) Hashtbl.t
+    ; mutable new_peer_callback: (Network_peer.Peer.t -> unit) option
     ; mutable finished: bool }
 
   and subscription =
@@ -437,6 +438,13 @@ module Helper = struct
         | None ->
             Or_error.errorf "incoming stream for protocol we don't know about?"
         )
+    | "newPeer" -> (
+      let%bind ip = v |> member "ip" |> to_string_res in
+      let%bind communication_port = v |> member "communication_port" |> to_int_res in
+      let%map discovery_port = v |> member "discovery_port" |> to_int_res in
+      Option.iter t.new_peer_callback ~f:(fun cb -> cb (Network_peer.Peer.create (Unix.Inet_addr.of_string ip) ~communication_port ~discovery_port)) ;
+      ()
+    )
     (* Received a message on some stream *)
     | "incomingStreamMsg" -> (
         let%bind stream_idx = v |> member "stream_idx" |> to_int_res in
@@ -486,6 +494,7 @@ module Helper = struct
       ; outstanding_requests= Hashtbl.create (module Int)
       ; subscriptions= Hashtbl.create (module Int)
       ; streams= Hashtbl.create (module Int)
+      ; new_peer_callback= None
       ; protocol_handlers= Hashtbl.create (module String)
       ; seqno= 1
       ; finished= false }
@@ -652,7 +661,7 @@ end
 
 let me (net : Helper.t) = net.me_keypair
 
-let configure net ~me ~maddrs ~network_id =
+let configure net ~me ~maddrs ~network_id ?on_new_peer =
   match%map
     Helper.do_rpc net
       (module Helper.Rpcs.Configure)
@@ -929,8 +938,8 @@ let%test_module "coda network tests" =
       let%bind kp_b = Keypair.random a in
       let maddrs = ["/ip4/127.0.0.1/tcp/0"] in
       let%bind () =
-        configure a ~me:kp_a ~maddrs ~network_id >>| Or_error.ok_exn
-      and () = configure b ~me:kp_b ~maddrs ~network_id >>| Or_error.ok_exn in
+        configure a ~me:kp_a ~maddrs ~network_id ~on_new_peer:None >>| Or_error.ok_exn
+      and () = configure b ~me:kp_b ~maddrs ~network_id ~on_new_peer:None >>| Or_error.ok_exn in
       (* Give the helpers time to announce and discover each other on localhost *)
       let%map () = after (Time.Span.of_sec 0.5) in
       let shutdown () =
@@ -946,7 +955,6 @@ let%test_module "coda network tests" =
         let open Deferred.Let_syntax in
         let%bind a, b, shutdown = setup_two_nodes "test_stream" in
         let a_peerid = Keypair.to_peerid (me a |> Option.value_exn) in
-        let%bind () = after (sec 0.5) in
         let handler_finished = ref false in
         let%bind echo_handler =
           handle_protocol a ~on_handler_error:`Raise ~protocol:"echo"
@@ -986,7 +994,6 @@ let%test_module "coda network tests" =
         let%bind a, b, shutdown = setup_two_nodes "test_pubsub" in
         let should_forward_message ~sender:_ ~data:_ = return true in
         (* Give the libp2p helpers time to see each other. *)
-        let%bind () = after (sec 0.5) in
         let%bind a_sub =
           Pubsub.subscribe a "test" ~should_forward_message
           |> Deferred.Or_error.ok_exn
